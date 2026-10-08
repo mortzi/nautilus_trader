@@ -1985,6 +1985,13 @@ impl DeribitWsFeedHandler {
                         DeribitWsChannel::InstrumentState => {
                             match serde_json::from_str::<DeribitInstrumentStateMsg>(data.get()) {
                                 Ok(state_msg) => {
+                                    if state_msg.state == DeribitInstrumentState::Unknown {
+                                        log::warn!(
+                                            "Unknown instrument state, ignoring: {}",
+                                            data.get()
+                                        );
+                                        return None;
+                                    }
                                     log::debug!(
                                         "Instrument state change: {} -> {} (timestamp: {})",
                                         state_msg.instrument_name,
@@ -2008,8 +2015,7 @@ impl DeribitWsFeedHandler {
                                     };
 
                                     let action = MarketStatusAction::from(state_msg.state);
-                                    let is_trading =
-                                        Some(state_msg.state == DeribitInstrumentState::Started);
+                                    let is_trading = state_msg.state.is_trading();
                                     let ts_event = UnixNanos::from(state_msg.timestamp * 1_000_000);
                                     let status = InstrumentStatus::new(
                                         instrument_id,

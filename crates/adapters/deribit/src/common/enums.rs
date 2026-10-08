@@ -149,6 +149,11 @@ pub enum DeribitOptionType {
 }
 
 /// Deribit instrument lifecycle state.
+///
+/// The `instrument.state.{kind}.{currency}` channel sends both the lifecycle events
+/// (`created`, `started`, `settled`, `closed`, `terminated`) and the order book states
+/// documented for the channel (`open`, `settlement`, `delivered`, `inactive`, `locked`,
+/// `halted`, `archivized`). Any other value deserializes to `Unknown`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, AsRefStr, EnumIter, EnumString, Serialize, Deserialize,
 )]
@@ -165,17 +170,40 @@ pub enum DeribitInstrumentState {
     Closed,
     /// Instrument has been terminated.
     Terminated,
+    /// Book is running: new orders, edits and cancels are accepted.
+    Open,
+    /// Book is in settlement or delivery: no new orders, edits or cancels.
+    Settlement,
+    /// Book has been delivered (final state before archiving).
+    Delivered,
+    /// Book has been deactivated: no new orders, edits or cancels.
+    Inactive,
+    /// Only cancels are accepted.
+    Locked,
+    /// Book has been halted as the result of an error.
+    Halted,
+    /// Instrument has been moved to expired instruments (final state).
+    Archivized,
+    /// A state not known to this adapter.
+    #[serde(other)]
+    Unknown,
+}
+
+impl DeribitInstrumentState {
+    /// Returns whether the instrument is trading in this state, or `None` if the state is unknown.
+    #[must_use]
+    pub fn is_trading(&self) -> Option<bool> {
+        match self {
+            Self::Started | Self::Open => Some(true),
+            Self::Unknown => None,
+            _ => Some(false),
+        }
+    }
 }
 
 impl Display for DeribitInstrumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Created => write!(f, "created"),
-            Self::Started => write!(f, "started"),
-            Self::Settled => write!(f, "settled"),
-            Self::Closed => write!(f, "closed"),
-            Self::Terminated => write!(f, "terminated"),
-        }
+        write!(f, "{}", self.as_ref())
     }
 }
 
@@ -183,10 +211,17 @@ impl From<DeribitInstrumentState> for MarketStatusAction {
     fn from(state: DeribitInstrumentState) -> Self {
         match state {
             DeribitInstrumentState::Created => Self::PreOpen,
-            DeribitInstrumentState::Started => Self::Trading,
-            DeribitInstrumentState::Settled => Self::Close,
-            DeribitInstrumentState::Closed => Self::Close,
-            DeribitInstrumentState::Terminated => Self::NotAvailableForTrading,
+            DeribitInstrumentState::Started | DeribitInstrumentState::Open => Self::Trading,
+            DeribitInstrumentState::Settlement => Self::Pause,
+            DeribitInstrumentState::Settled
+            | DeribitInstrumentState::Closed
+            | DeribitInstrumentState::Delivered => Self::Close,
+            DeribitInstrumentState::Locked => Self::Suspend,
+            DeribitInstrumentState::Halted => Self::Halt,
+            DeribitInstrumentState::Terminated
+            | DeribitInstrumentState::Inactive
+            | DeribitInstrumentState::Archivized => Self::NotAvailableForTrading,
+            DeribitInstrumentState::Unknown => Self::None,
         }
     }
 }
@@ -303,10 +338,60 @@ mod tests {
         DeribitInstrumentState::Terminated,
         MarketStatusAction::NotAvailableForTrading
     )]
+    #[case(DeribitInstrumentState::Open, MarketStatusAction::Trading)]
+    #[case(DeribitInstrumentState::Settlement, MarketStatusAction::Pause)]
+    #[case(DeribitInstrumentState::Delivered, MarketStatusAction::Close)]
+    #[case(
+        DeribitInstrumentState::Inactive,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    #[case(DeribitInstrumentState::Locked, MarketStatusAction::Suspend)]
+    #[case(DeribitInstrumentState::Halted, MarketStatusAction::Halt)]
+    #[case(
+        DeribitInstrumentState::Archivized,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    #[case(DeribitInstrumentState::Unknown, MarketStatusAction::None)]
     fn test_deribit_instrument_state_to_market_status_action(
         #[case] state: DeribitInstrumentState,
         #[case] expected: MarketStatusAction,
     ) {
         assert_eq!(MarketStatusAction::from(state), expected);
+    }
+
+    #[rstest]
+    #[case("created", DeribitInstrumentState::Created)]
+    #[case("started", DeribitInstrumentState::Started)]
+    #[case("settled", DeribitInstrumentState::Settled)]
+    #[case("closed", DeribitInstrumentState::Closed)]
+    #[case("terminated", DeribitInstrumentState::Terminated)]
+    #[case("open", DeribitInstrumentState::Open)]
+    #[case("settlement", DeribitInstrumentState::Settlement)]
+    #[case("delivered", DeribitInstrumentState::Delivered)]
+    #[case("inactive", DeribitInstrumentState::Inactive)]
+    #[case("locked", DeribitInstrumentState::Locked)]
+    #[case("halted", DeribitInstrumentState::Halted)]
+    #[case("archivized", DeribitInstrumentState::Archivized)]
+    #[case("some_future_state", DeribitInstrumentState::Unknown)]
+    fn test_deribit_instrument_state_deserialize(
+        #[case] raw: &str,
+        #[case] expected: DeribitInstrumentState,
+    ) {
+        let state: DeribitInstrumentState = serde_json::from_str(&format!("\"{raw}\"")).unwrap();
+        assert_eq!(state, expected);
+    }
+
+    #[rstest]
+    #[case(DeribitInstrumentState::Started, Some(true))]
+    #[case(DeribitInstrumentState::Open, Some(true))]
+    #[case(DeribitInstrumentState::Created, Some(false))]
+    #[case(DeribitInstrumentState::Inactive, Some(false))]
+    #[case(DeribitInstrumentState::Locked, Some(false))]
+    #[case(DeribitInstrumentState::Unknown, None)]
+    fn test_deribit_instrument_state_is_trading(
+        #[case] state: DeribitInstrumentState,
+        #[case] expected: Option<bool>,
+    ) {
+        assert_eq!(state.is_trading(), expected);
     }
 }
