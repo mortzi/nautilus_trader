@@ -29,6 +29,7 @@ use crate::{
         urls::{get_http_base_url, get_ws_url},
     },
     http::models::DeribitProductType,
+    websocket::enums::DeribitUpdateInterval,
 };
 
 /// Configuration for the Deribit data client.
@@ -86,6 +87,10 @@ pub struct DeribitDataClientConfig {
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Default update interval for subscriptions on the `ticker` channel (mark prices,
+    /// index prices, option greeks) when the command params don't set `interval`.
+    /// When unset: `raw` if authenticated, otherwise `100ms`.
+    pub ticker_interval: Option<DeribitUpdateInterval>,
 }
 
 #[cfg(feature = "python")]
@@ -347,6 +352,18 @@ auto_load_missing_instruments = true
         );
         assert_eq!(config.heartbeat_interval_secs, 15);
         assert!(config.auto_load_missing_instruments);
+    }
+
+    #[rstest]
+    #[case("", None)]
+    #[case("ticker_interval = \"agg2\"", Some(DeribitUpdateInterval::Agg2))]
+    #[case("ticker_interval = \"100ms\"", Some(DeribitUpdateInterval::Ms100))]
+    fn test_data_config_toml_ticker_interval(
+        #[case] toml_str: &str,
+        #[case] expected: Option<DeribitUpdateInterval>,
+    ) {
+        let config: DeribitDataClientConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ticker_interval, expected);
     }
 
     #[rstest]

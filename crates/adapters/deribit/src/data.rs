@@ -269,14 +269,25 @@ impl DeribitDataClient {
     /// If authenticated, we prefer Raw interval for best data quality.
     /// Users can still override via params if they want 100ms or agg2.
     fn get_interval(&self, params: &Option<Params>) -> Option<DeribitUpdateInterval> {
-        if let Some(interval) = params
+        Self::params_interval(params).or_else(|| self.default_interval())
+    }
+
+    /// Gets the interval for a `ticker` channel subscription: params, then the
+    /// configured `ticker_interval`, then the same default as [`Self::get_interval`].
+    fn get_ticker_interval(&self, params: &Option<Params>) -> Option<DeribitUpdateInterval> {
+        Self::params_interval(params)
+            .or(self.config.ticker_interval)
+            .or_else(|| self.default_interval())
+    }
+
+    fn params_interval(params: &Option<Params>) -> Option<DeribitUpdateInterval> {
+        params
             .as_ref()
             .and_then(|p| p.get_str("interval"))
             .and_then(|s| s.parse::<DeribitUpdateInterval>().ok())
-        {
-            return Some(interval);
-        }
+    }
 
+    fn default_interval(&self) -> Option<DeribitUpdateInterval> {
         // Default to Raw if authenticated, otherwise None (100ms default)
         if let Some(ws) = self.ws_client.as_ref()
             && ws.is_authenticated()
@@ -1144,7 +1155,7 @@ impl DataClient for DeribitDataClient {
             .clone();
         let http_client = self.http_client.clone();
         let instruments = Arc::clone(&self.instruments);
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Track subscription so handler gates MarkPriceUpdate emission
         self.mark_price_subs.insert(instrument_id);
@@ -1183,7 +1194,7 @@ impl DataClient for DeribitDataClient {
             .clone();
         let http_client = self.http_client.clone();
         let instruments = Arc::clone(&self.instruments);
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Track subscription so handler gates IndexPriceUpdate emission
         self.index_price_subs.insert(instrument_id);
@@ -1329,7 +1340,7 @@ impl DataClient for DeribitDataClient {
             .clone();
         let http_client = self.http_client.clone();
         let instruments = Arc::clone(&self.instruments);
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Track subscription so handler gates OptionGreeks emission
         self.option_greeks_subs.insert(instrument_id);
@@ -1629,7 +1640,7 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
         let instrument_id = cmd.instrument_id;
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Remove subscription tracking so handler stops emitting MarkPriceUpdate
         self.mark_price_subs.remove(&instrument_id);
@@ -1656,7 +1667,7 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
         let instrument_id = cmd.instrument_id;
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Remove subscription tracking so handler stops emitting IndexPriceUpdate
         self.index_price_subs.remove(&instrument_id);
@@ -1743,7 +1754,7 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
         let instrument_id = cmd.instrument_id;
-        let interval = self.get_interval(&cmd.params);
+        let interval = self.get_ticker_interval(&cmd.params);
 
         // Remove subscription tracking so handler stops emitting OptionGreeks
         self.option_greeks_subs.remove(&instrument_id);

@@ -64,6 +64,7 @@ use nautilus_deribit::{
     data::DeribitDataClient,
     data_types::DeribitBookSummary,
     http::models::DeribitProductType,
+    websocket::enums::DeribitUpdateInterval,
 };
 use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
@@ -1442,6 +1443,79 @@ async fn test_data_client_subscribe_quotes() {
         matches!(event, DataEvent::Data(Data::Quote(_))),
         "Expected Quote event, was: {event:?}"
     );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::default(None, None, "ticker.BTC-PERPETUAL.100ms")]
+#[case::config(Some(DeribitUpdateInterval::Agg2), None, "ticker.BTC-PERPETUAL.agg2")]
+#[case::params_override(
+    Some(DeribitUpdateInterval::Agg2),
+    Some("100ms"),
+    "ticker.BTC-PERPETUAL.100ms"
+)]
+#[tokio::test]
+async fn test_data_client_subscribe_mark_prices_ticker_interval(
+    #[case] ticker_interval: Option<DeribitUpdateInterval>,
+    #[case] param_interval: Option<&str>,
+    #[case] expected_channel: &str,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = DeribitDataClientConfig {
+        ticker_interval,
+        ..create_test_config(addr)
+    };
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || async { *state.connection_count.lock().await > 0 },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let params = param_interval.map(|interval| {
+        let mut params = Params::new();
+        params.insert("interval".to_string(), json!(interval));
+        params
+    });
+    let cmd = SubscribeMarkPrices::new(
+        InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+        Some(*DERIBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        params,
+    );
+    client.subscribe_mark_prices(cmd).unwrap();
+
+    wait_until_async(
+        || async {
+            state
+                .subscription_events
+                .lock()
+                .await
+                .iter()
+                .any(|(topic, _)| topic.starts_with("ticker."))
+        },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let topics: Vec<String> = state
+        .subscription_events
+        .lock()
+        .await
+        .iter()
+        .map(|(topic, _)| topic.clone())
+        .filter(|topic| topic.starts_with("ticker."))
+        .collect();
+    assert_eq!(topics, vec![expected_channel.to_string()]);
 
     client.disconnect().await.unwrap();
 }
