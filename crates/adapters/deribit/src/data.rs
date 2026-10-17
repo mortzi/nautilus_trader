@@ -145,6 +145,11 @@ impl Refresher {
             })
             .collect();
         drop(known);
+        log::info!(
+            "Instrument refresh ({:?}): {} new or changed",
+            self.currencies,
+            changed.len()
+        );
         if changed.is_empty() {
             return Ok(0);
         }
@@ -158,7 +163,6 @@ impl Refresher {
         if let Some(ws) = &self.ws {
             ws.cache_instruments(&changed);
         }
-        log::info!("Instrument refresh: {} new or changed", changed.len());
         for instrument in &changed {
             if let Err(e) = self.sender.send(DataEvent::Instrument(instrument.clone())) {
                 log::warn!(
