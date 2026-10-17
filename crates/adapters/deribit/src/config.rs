@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     common::{
         credential::credential_env_vars,
-        enums::DeribitEnvironment,
+        enums::{DeribitCurrency, DeribitEnvironment},
         urls::{get_http_base_url, get_ws_url},
     },
     http::models::DeribitProductType,
@@ -78,9 +78,12 @@ pub struct DeribitDataClientConfig {
     /// Optional WebSocket authentication timeout (seconds), defaulting to
     /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
     pub auth_timeout_secs: Option<u64>,
-    /// Interval for refreshing instruments (in minutes).
-    #[builder(default = 60)]
+    /// Interval for refreshing instruments (in minutes); 0 disables the refresh.
+    #[builder(default = 0)]
     pub update_instruments_interval_mins: u64,
+    /// Deribit currencies whose instruments this client loads (on connect and on each refresh).
+    /// Unset or empty: every currency (`any`).
+    pub instrument_currencies: Option<Vec<DeribitCurrency>>,
     /// If `true`, subscribes for uncached instruments lazy-load via HTTP; otherwise fail fast.
     #[builder(default = false)]
     pub auto_load_missing_instruments: bool,

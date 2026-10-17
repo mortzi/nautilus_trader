@@ -58,7 +58,7 @@ use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_deribit::{
     common::{
         consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
-        enums::DeribitEnvironment,
+        enums::{DeribitCurrency, DeribitEnvironment},
     },
     config::DeribitDataClientConfig,
     data::DeribitDataClient,
@@ -198,6 +198,12 @@ struct TestServerState {
     get_instrument_request_count: Arc<AtomicUsize>,
     ticker_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
     ticker_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    // The `currency` of every public/get_instruments request, in order.
+    get_instruments_currencies: Arc<tokio::sync::Mutex<Vec<String>>>,
+    // `instrument.state` notifications (their `data`) sent after any instrument.state subscribe.
+    instrument_state_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    // When true, public/get_instrument answers an option with the requested name and strike.
+    echo_instrument_name: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -259,7 +265,7 @@ async fn handle_jsonrpc_request(
     let params = request.get("params").cloned();
 
     match method {
-        "public/get_instruments" => handle_get_instruments(id, params).await,
+        "public/get_instruments" => handle_get_instruments(id, params, &state).await,
         "public/get_combos" => handle_get_combos(id).await,
         "public/get_book_summary_by_currency" => {
             let mut data = load_json("http_get_book_summary_by_currency.json");
@@ -321,6 +327,18 @@ async fn handle_jsonrpc_request(
                 };
             let mut data = load_json(fixture);
             data["id"] = json!(id);
+            if state.echo_instrument_name.load(Ordering::Relaxed)
+                && fixture == "http_get_instrument_option.json"
+            {
+                data["result"]["instrument_name"] = json!(instrument_name);
+                if let Some(strike) = instrument_name
+                    .split('-')
+                    .nth(2)
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    data["result"]["strike"] = json!(strike);
+                }
+            }
             Json(data).into_response()
         }
         _ => Json(json!({
@@ -399,11 +417,20 @@ async fn handle_get_combos(id: u64) -> Response {
     .into_response()
 }
 
-async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
+async fn handle_get_instruments(
+    id: u64,
+    params: Option<Value>,
+    state: &TestServerState,
+) -> Response {
     let currency = params
         .as_ref()
         .and_then(|p| p.get("currency"))
         .and_then(|c| c.as_str());
+    state
+        .get_instruments_currencies
+        .lock()
+        .await
+        .push(currency.unwrap_or("none").to_string());
 
     match currency {
         Some("any" | "BTC") | None => {
@@ -442,7 +469,10 @@ async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
             "jsonrpc": "2.0",
             "id": id,
             "result": [],
-            "testnet": true
+            "testnet": true,
+            "usIn": 1699999999000000_u64,
+            "usOut": 1699999999001000_u64,
+            "usDiff": 1000
         }))
         .into_response(),
     }
@@ -555,6 +585,25 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                                         .is_err()
                                 {
                                     break;
+                                }
+
+                                if channel.starts_with("instrument.state.") {
+                                    let events =
+                                        state.instrument_state_payloads.lock().await.clone();
+                                    for data in events {
+                                        let notification = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "subscription",
+                                            "params": {"channel": channel, "data": data},
+                                        });
+                                        if socket
+                                            .send(Message::Text(notification.to_string().into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1973,6 +2022,41 @@ async fn test_subscribe_funding_rates_rejects_non_perpetual() {
         "funding rates subscribe for a non-perpetual must not forward a perpetual.* subscribe"
     );
 
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_fetches_only_configured_currencies() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let config = DeribitDataClientConfig {
+        instrument_currencies: Some(vec![DeribitCurrency::BTC, DeribitCurrency::USDC]),
+        ..create_test_config(addr)
+    };
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(
+        *state.get_instruments_currencies.lock().await,
+        vec!["BTC", "USDC"]
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_fetches_any_currency_by_default() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, create_test_config(addr)).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(*state.get_instruments_currencies.lock().await, vec!["any"]);
     client.disconnect().await.unwrap();
 }
 

@@ -297,6 +297,14 @@ impl DeribitDataClient {
         None
     }
 
+    /// The currencies to load instruments for: `instrument_currencies`, or every currency.
+    fn fetch_currencies(&self) -> Vec<DeribitCurrency> {
+        match &self.config.instrument_currencies {
+            Some(currencies) if !currencies.is_empty() => currencies.clone(),
+            _ => vec![DeribitCurrency::ANY],
+        }
+    }
+
     /// Spawns a task to process WebSocket messages.
     fn spawn_stream_task(
         &self,
@@ -724,12 +732,17 @@ impl DataClient for DeribitDataClient {
 
         let mut all_instruments = Vec::new();
 
-        for product_type in &product_types {
+        for (product_type, currency) in product_types
+            .iter()
+            .flat_map(|p| self.fetch_currencies().into_iter().map(move |c| (p, c)))
+        {
             let fetched = self
                 .http_client
-                .request_instruments(DeribitCurrency::ANY, Some(*product_type))
+                .request_instruments(currency, Some(*product_type))
                 .await
-                .with_context(|| format!("failed to request instruments for {product_type:?}"))?;
+                .with_context(|| {
+                    format!("failed to request instruments for {product_type:?} {currency:?}")
+                })?;
 
             // Cache in http client
             self.http_client.cache_instruments(&fetched);
