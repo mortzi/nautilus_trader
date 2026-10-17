@@ -55,11 +55,11 @@ use nautilus_core::{
 };
 use nautilus_live::{
     SocketControl,
-    task::{TaskGroup, TaskGroupGuard},
+    task::{TaskGroup, TaskGroupGuard, TaskSpawner},
 };
 use nautilus_model::{
     data::{CustomData, Data, DataType},
-    enums::BookType,
+    enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::Price,
@@ -105,6 +105,153 @@ pub struct DeribitDataClient {
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     combo_leg_trade_subs: Arc<AtomicMap<InstrumentId, AHashMap<InstrumentId, usize>>>,
     clock: &'static AtomicTime,
+}
+
+/// What the refresh (`update_instruments_interval_mins`) needs, cloned so the timer task owns it.
+struct Refresher {
+    http: DeribitHttpClient,
+    ws: Option<DeribitWebSocketClient>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    sender: EventSender<DataEvent>,
+    product_types: Vec<DeribitProductType>,
+    currencies: Vec<DeribitCurrency>,
+}
+
+impl Refresher {
+    async fn run(&self) -> anyhow::Result<usize> {
+        let mut fetched = Vec::new();
+        for product_type in &self.product_types {
+            for currency in &self.currencies {
+                fetched.extend(
+                    self.http
+                        .request_instruments(*currency, Some(*product_type))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to refresh instruments for {product_type:?} {currency:?}"
+                            )
+                        })?,
+                );
+            }
+        }
+
+        let known = self.instruments.load();
+        let changed: Vec<InstrumentAny> = fetched
+            .into_iter()
+            .filter(|i| {
+                known
+                    .get(&i.id())
+                    .is_none_or(|cached| fingerprint(cached) != fingerprint(i))
+            })
+            .collect();
+        drop(known);
+        log::info!(
+            "Instrument refresh ({:?}): {} new or changed",
+            self.currencies,
+            changed.len()
+        );
+        if changed.is_empty() {
+            return Ok(0);
+        }
+
+        self.instruments.rcu(|m| {
+            for instrument in &changed {
+                m.insert(instrument.id(), instrument.clone());
+            }
+        });
+        self.http.cache_instruments(&changed);
+        if let Some(ws) = &self.ws {
+            ws.cache_instruments(&changed);
+        }
+        for instrument in &changed {
+            if let Err(e) = self.sender.send(DataEvent::Instrument(instrument.clone())) {
+                log::warn!(
+                    "Failed to send refreshed instrument {}: {e}",
+                    instrument.id()
+                );
+            }
+        }
+        Ok(changed.len())
+    }
+}
+
+/// Runs `refresh` every `every` until `cancellation`; a refresh in flight is dropped on cancel, so
+/// nothing is sent after a disconnect begins.
+async fn refresh_loop<F, Fut>(every: Duration, cancellation: CancellationToken, mut refresh: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(every) => {}
+            () = cancellation.cancelled() => break,
+        }
+        tokio::select! {
+            () = refresh() => {}
+            () = cancellation.cancelled() => break,
+        }
+    }
+}
+
+/// An instrument's definition without its timestamps: `==` on instruments compares ids only.
+fn fingerprint(instrument: &InstrumentAny) -> String {
+    let mut value = serde_json::to_value(instrument).unwrap_or(serde_json::Value::Null);
+    // `{"CryptoOption": {...}}`: the fields sit one level down.
+    if let serde_json::Value::Object(outer) = &mut value {
+        for inner in outer.values_mut() {
+            if let serde_json::Value::Object(fields) = inner {
+                fields.remove("ts_event");
+                fields.remove("ts_init");
+            }
+        }
+    }
+    value.to_string()
+}
+
+/// How long the stream task gathers `instrument.state` announcements before one fetch.
+const LISTING_WAIT: Duration = Duration::from_secs(1);
+
+/// Picks up contracts Deribit announces on `instrument.state` (`created`, `started`, …) that the
+/// client doesn't know yet. The event carries only the name, and a new expiry lists 50–150
+/// contracts in the same second, so instead of one `public/get_instrument` per contract the first
+/// unknown one starts a wait of [`LISTING_WAIT`] and then one refresh of the client's configured
+/// currencies and product types ([`Refresher::run`]): new instruments are sent as
+/// [`DataEvent::Instrument`], like the ones `connect` loads, so the data engine adds them to its
+/// cache and to a running option chain.
+#[derive(Clone)]
+struct Lister {
+    refresher: Arc<Refresher>,
+    spawner: TaskSpawner,
+    /// A fetch is waiting or running; announcements until it starts fetching are covered by it.
+    pending: Arc<AtomicBool>,
+}
+
+impl Lister {
+    fn fetch_if_unknown(
+        &self,
+        instrument_id: InstrumentId,
+        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    ) {
+        if instruments.contains_key(&instrument_id) || self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let lister = self.clone();
+        let spawned = self.spawner.spawn(async move {
+            tokio::time::sleep(LISTING_WAIT).await;
+            // Announcements from here on start another fetch: this one may miss them.
+            lister.pending.store(false, Ordering::Release);
+            if let Err(e) = lister.refresher.run().await {
+                log::warn!("Failed to fetch listed instruments (after {instrument_id}): {e:?}");
+            }
+        });
+
+        if let Err(e) = spawned {
+            self.pending.store(false, Ordering::Release);
+            log::warn!("Skipping fetch of listed instrument {instrument_id}: {e}");
+        }
+    }
 }
 
 impl DeribitDataClient {
@@ -297,6 +444,52 @@ impl DeribitDataClient {
         None
     }
 
+    /// The product types to load instruments for (futures when none are configured).
+    fn product_types(&self) -> Vec<DeribitProductType> {
+        if self.config.product_types.is_empty() {
+            vec![DeribitProductType::Future]
+        } else {
+            self.config.product_types.clone()
+        }
+    }
+
+    /// How often to refresh the instruments: `update_instruments_interval_mins`, `None` for 0.
+    #[must_use]
+    pub fn refresh_interval(&self) -> Option<Duration> {
+        let mins = self.config.update_instruments_interval_mins;
+        (mins > 0).then(|| Duration::from_secs(mins * 60))
+    }
+
+    fn refresher(&self) -> Refresher {
+        Refresher {
+            http: self.http_client.clone(),
+            ws: self.ws_client.clone(),
+            instruments: Arc::clone(&self.instruments),
+            sender: self.data_sender.clone(),
+            product_types: self.product_types(),
+            currencies: self.fetch_currencies(),
+        }
+    }
+
+    /// Fetches the configured instruments again and sends the new or changed ones as
+    /// [`DataEvent::Instrument`], so the data engine adds new strikes to running option chains.
+    /// Returns how many it sent; on an error nothing is cached or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any instruments request fails.
+    pub async fn refresh_instruments(&self) -> anyhow::Result<usize> {
+        self.refresher().run().await
+    }
+
+    /// The currencies to load instruments for: `instrument_currencies`, or every currency.
+    fn fetch_currencies(&self) -> Vec<DeribitCurrency> {
+        match &self.config.instrument_currencies {
+            Some(currencies) if !currencies.is_empty() => currencies.clone(),
+            _ => vec![DeribitCurrency::ANY],
+        }
+    }
+
     /// Spawns a task to process WebSocket messages.
     fn spawn_stream_task(
         &self,
@@ -305,6 +498,14 @@ impl DeribitDataClient {
         let data_sender = self.data_sender.clone();
         let instruments = Arc::clone(&self.instruments);
         let cancellation = self.cancellation_token.clone();
+        let lister = Lister {
+            refresher: Arc::new(self.refresher()),
+            spawner: self
+                .command_tasks
+                .spawner()
+                .context("failed to get a spawner for listed-instrument fetches")?,
+            pending: Arc::new(AtomicBool::new(false)),
+        };
 
         let future = async move {
             tokio::pin!(stream);
@@ -313,7 +514,9 @@ impl DeribitDataClient {
                 tokio::select! {
                     maybe_msg = stream.next() => {
                         match maybe_msg {
-                            Some(msg) => Self::handle_ws_message(msg, &data_sender, &instruments),
+                            Some(msg) => {
+                                Self::handle_ws_message(msg, &data_sender, &instruments, &lister);
+                            }
                             None => {
                                 log::debug!("WebSocket stream ended");
                                 break;
@@ -339,6 +542,7 @@ impl DeribitDataClient {
         message: NautilusWsMessage,
         sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+        lister: &Lister,
     ) {
         match message {
             NautilusWsMessage::Data(payloads) => {
@@ -382,6 +586,13 @@ impl DeribitDataClient {
                 }
             }
             NautilusWsMessage::InstrumentStatus(status) => {
+                if matches!(
+                    status.action,
+                    MarketStatusAction::PreOpen | MarketStatusAction::Trading
+                ) {
+                    lister.fetch_if_unknown(status.instrument_id, instruments);
+                }
+
                 if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
                     log::error!("Failed to send instrument status event: {e}");
                 }
@@ -716,20 +927,21 @@ impl DataClient for DeribitDataClient {
         register_deribit_custom_data();
 
         // Fetch instruments for each configured product type
-        let product_types = if self.config.product_types.is_empty() {
-            vec![DeribitProductType::Future]
-        } else {
-            self.config.product_types.clone()
-        };
+        let product_types = self.product_types();
 
         let mut all_instruments = Vec::new();
 
-        for product_type in &product_types {
+        for (product_type, currency) in product_types
+            .iter()
+            .flat_map(|p| self.fetch_currencies().into_iter().map(move |c| (p, c)))
+        {
             let fetched = self
                 .http_client
-                .request_instruments(DeribitCurrency::ANY, Some(*product_type))
+                .request_instruments(currency, Some(*product_type))
                 .await
-                .with_context(|| format!("failed to request instruments for {product_type:?}"))?;
+                .with_context(|| {
+                    format!("failed to request instruments for {product_type:?} {currency:?}")
+                })?;
 
             // Cache in http client
             self.http_client.cache_instruments(&fetched);
@@ -817,6 +1029,21 @@ impl DataClient for DeribitDataClient {
                 )));
             }
             return Err(e);
+        }
+
+        if let Some(every) = self.refresh_interval() {
+            let refresher = Arc::new(self.refresher());
+            let timer = refresh_loop(every, self.cancellation_token.clone(), move || {
+                let refresher = Arc::clone(&refresher);
+                async move {
+                    if let Err(e) = refresher.run().await {
+                        log::warn!("Instrument refresh failed: {e:?}");
+                    }
+                }
+            });
+            if let Err(e) = self.session_tasks.spawn(timer) {
+                log::warn!("Instrument refresh not started: {e}");
+            }
         }
 
         self.is_connected.store(true, Ordering::Release);
@@ -2252,5 +2479,71 @@ impl DataClient for DeribitDataClient {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod refresh_loop_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use rstest::rstest;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_refresh_loop_runs_every_interval_until_cancelled() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        let counter = Arc::clone(&runs);
+        let looping = tokio::spawn(refresh_loop(
+            Duration::from_millis(20),
+            cancellation.clone(),
+            move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), looping)
+            .await
+            .expect("the loop stops when cancelled")
+            .unwrap();
+        let at_cancel = runs.load(Ordering::Relaxed);
+        assert!(at_cancel >= 3, "ran {at_cancel} times in 130 ms at 20 ms");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            at_cancel,
+            "nothing runs after cancel"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_refresh_loop_cancels_a_running_refresh() {
+        let cancellation = CancellationToken::new();
+        let looping = tokio::spawn(refresh_loop(
+            Duration::from_millis(10),
+            cancellation.clone(),
+            std::future::pending::<()>,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // the first run is now in flight
+        cancellation.cancel();
+
+        tokio::time::timeout(Duration::from_millis(500), looping)
+            .await
+            .expect("a refresh in flight doesn't hold up the cancel")
+            .unwrap();
     }
 }

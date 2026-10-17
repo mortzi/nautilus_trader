@@ -47,8 +47,9 @@ use nautilus_common::{
         data::{
             InstrumentResponse, RequestCustomData, RequestInstrument,
             RequestOptionChainReferencePrice, SubscribeBars, SubscribeBookDeltas,
-            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeTrades,
+            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeTrades,
         },
         system::SocketState,
     },
@@ -58,7 +59,7 @@ use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_deribit::{
     common::{
         consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
-        enums::DeribitEnvironment,
+        enums::{DeribitCurrency, DeribitEnvironment},
     },
     config::DeribitDataClientConfig,
     data::DeribitDataClient,
@@ -71,6 +72,7 @@ use nautilus_model::{
     data::{BarType, CustomData, Data, DataType, TradeTick},
     enums::BookType,
     identifiers::{InstrumentId, OptionSeriesId},
+    instruments::Instrument,
     types::Price,
 };
 use nautilus_network::http::HttpClient;
@@ -198,6 +200,12 @@ struct TestServerState {
     get_instrument_request_count: Arc<AtomicUsize>,
     ticker_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
     ticker_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    // The `currency` of every public/get_instruments request, in order.
+    get_instruments_currencies: Arc<tokio::sync::Mutex<Vec<String>>>,
+    // `instrument.state` notifications (their `data`) sent after any instrument.state subscribe.
+    instrument_state_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    // When set, public/get_instruments answers every currency with this `result`.
+    instruments_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 #[derive(Default)]
@@ -259,7 +267,7 @@ async fn handle_jsonrpc_request(
     let params = request.get("params").cloned();
 
     match method {
-        "public/get_instruments" => handle_get_instruments(id, params).await,
+        "public/get_instruments" => handle_get_instruments(id, params, &state).await,
         "public/get_combos" => handle_get_combos(id).await,
         "public/get_book_summary_by_currency" => {
             let mut data = load_json("http_get_book_summary_by_currency.json");
@@ -399,11 +407,46 @@ async fn handle_get_combos(id: u64) -> Response {
     .into_response()
 }
 
-async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
+async fn handle_get_instruments(
+    id: u64,
+    params: Option<Value>,
+    state: &TestServerState,
+) -> Response {
     let currency = params
         .as_ref()
         .and_then(|p| p.get("currency"))
         .and_then(|c| c.as_str());
+    state
+        .get_instruments_currencies
+        .lock()
+        .await
+        .push(currency.unwrap_or("none").to_string());
+
+    if let Some(result) = state.instruments_override.lock().await.clone() {
+        let kind = params
+            .as_ref()
+            .and_then(|p| p.get("kind"))
+            .and_then(|k| k.as_str());
+        let result = match (result, kind) {
+            (Value::Array(items), Some(kind)) => Value::Array(
+                items
+                    .into_iter()
+                    .filter(|i| i.get("kind").and_then(|k| k.as_str()) == Some(kind))
+                    .collect(),
+            ),
+            (result, _) => result,
+        };
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+            "testnet": true,
+            "usIn": 1699999999000000_u64,
+            "usOut": 1699999999001000_u64,
+            "usDiff": 1000
+        }))
+        .into_response();
+    }
 
     match currency {
         Some("any" | "BTC") | None => {
@@ -442,7 +485,10 @@ async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
             "jsonrpc": "2.0",
             "id": id,
             "result": [],
-            "testnet": true
+            "testnet": true,
+            "usIn": 1699999999000000_u64,
+            "usOut": 1699999999001000_u64,
+            "usDiff": 1000
         }))
         .into_response(),
     }
@@ -555,6 +601,25 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                                         .is_err()
                                 {
                                     break;
+                                }
+
+                                if channel.starts_with("instrument.state.") {
+                                    let events =
+                                        state.instrument_state_payloads.lock().await.clone();
+                                    for data in events {
+                                        let notification = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "subscription",
+                                            "params": {"channel": channel, "data": data},
+                                        });
+                                        if socket
+                                            .send(Message::Text(notification.to_string().into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1978,6 +2043,41 @@ async fn test_subscribe_funding_rates_rejects_non_perpetual() {
 
 #[rstest]
 #[tokio::test]
+async fn test_connect_fetches_only_configured_currencies() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let config = DeribitDataClientConfig {
+        instrument_currencies: Some(vec![DeribitCurrency::BTC, DeribitCurrency::USDC]),
+        ..create_test_config(addr)
+    };
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(
+        *state.get_instruments_currencies.lock().await,
+        vec!["BTC", "USDC"]
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_fetches_any_currency_by_default() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, create_test_config(addr)).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(*state.get_instruments_currencies.lock().await, vec!["any"]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_data_client_emits_instruments_on_connect() {
     let (addr, _state) = start_test_server().await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -2274,4 +2374,405 @@ async fn test_data_client_request_data_ignores_unsupported_custom_type() {
     );
 
     client.disconnect().await.unwrap();
+}
+
+const NEW_OPTION: &str = "BTC-27DEC24-110000-C";
+
+fn state_event(name: &str, state: &str) -> Value {
+    json!({"instrument_name": name, "state": state, "timestamp": 1_700_000_000_000_u64})
+}
+
+fn subscribe_option_states(client: &mut DeribitDataClient) {
+    let mut params = Params::new();
+    params.insert("kind".to_string(), json!("option"));
+    params.insert("currency".to_string(), json!("BTC"));
+    client
+        .subscribe_instruments(SubscribeInstruments::new(
+            Some(*DERIBIT_CLIENT_ID),
+            *DERIBIT_VENUE,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(params),
+        ))
+        .unwrap();
+}
+
+fn instruments_named(events: &[DataEvent], name: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, DataEvent::Instrument(i) if i.id().symbol.as_str() == name))
+        .count()
+}
+
+fn has_status_for(events: &[DataEvent], name: &str) -> bool {
+    events.iter().any(
+        |e| matches!(e, DataEvent::InstrumentStatus(s) if s.instrument_id.symbol.as_str() == name),
+    )
+}
+
+/// The option in `http_get_instruments.json` (what `connect` caches with option product types).
+const CACHED_OPTION: &str = "BTC-27DEC24-100000-C";
+
+/// What `public/get_instruments` lists after connect: the cached option plus `names`.
+fn listing_with(names: &[String]) -> Value {
+    let base = load_json("http_get_instruments.json")["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "option")
+        .unwrap()
+        .clone();
+    let mut listed = vec![base.clone()];
+    for (n, name) in names.iter().enumerate() {
+        let mut option = base.clone();
+        option["instrument_name"] = json!(name);
+        option["strike"] = json!(name.split('-').nth(2).unwrap().parse::<f64>().unwrap());
+        option["instrument_id"] = json!(900_000 + n);
+        listed.push(option);
+    }
+    Value::Array(listed)
+}
+
+fn options_config(addr: SocketAddr) -> DeribitDataClientConfig {
+    DeribitDataClientConfig {
+        product_types: vec![DeribitProductType::Option],
+        ..create_test_config(addr)
+    }
+}
+
+/// Connects a client to the mock server, discards what `connect` sends, sets what the venue lists
+/// from now on (`listing`), and subscribes BTC option states (the mock then sends the
+/// `instrument.state` events the caller has set). Returns how many `get_instruments` calls connect
+/// made, so a test can count the ones after it.
+async fn connect_and_watch_states(
+    config: DeribitDataClientConfig,
+    state: &TestServerState,
+    listing: Option<Value>,
+) -> (
+    DeribitDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    usize,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+    let at_connect = state.get_instruments_currencies.lock().await.len();
+    *state.instruments_override.lock().await = listing;
+    subscribe_option_states(&mut client);
+    (client, rx, at_connect)
+}
+
+async fn fetches_after(state: &TestServerState, at_connect: usize) -> Vec<String> {
+    state.get_instruments_currencies.lock().await[at_connect..].to_vec()
+}
+
+/// Collects events until `done` holds for them (or the test timeout), then `settle` more.
+async fn collect_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    done: impl Fn(&[DataEvent]) -> bool,
+    settle: Duration,
+) -> Vec<DataEvent> {
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    while !done(&events) && tokio::time::Instant::now() < deadline {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            events.push(e);
+        }
+    }
+    let settle_until = tokio::time::Instant::now() + settle;
+    while tokio::time::Instant::now() < settle_until {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            events.push(e);
+        }
+    }
+    events
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_created_event_for_unknown_contract_fetches_and_sends_it() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "created"));
+    let listing = listing_with(&[NEW_OPTION.to_string()]);
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(options_config(addr), &state, Some(listing)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| instruments_named(e, NEW_OPTION) == 1 && has_status_for(e, NEW_OPTION),
+        Duration::from_millis(500),
+    )
+    .await;
+
+    assert_eq!(instruments_named(&events, NEW_OPTION), 1);
+    assert_eq!(
+        instruments_named(&events, CACHED_OPTION),
+        0,
+        "known ones aren't re-sent"
+    );
+    assert!(
+        has_status_for(&events, NEW_OPTION),
+        "the status event still arrives"
+    );
+    assert_eq!(fetches_after(&state, at_connect).await, vec!["any"]);
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        0
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_listing_burst_is_one_fetch() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let names: Vec<String> = (0..50)
+        .map(|n| format!("BTC-27DEC24-{}-C", 110_000 + n * 1_000))
+        .collect();
+    {
+        let mut payloads = state.instrument_state_payloads.lock().await;
+        for name in &names {
+            payloads.push(state_event(name, "created"));
+            payloads.push(state_event(name, "started"));
+        }
+    }
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(options_config(addr), &state, Some(listing_with(&names))).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| names.iter().all(|n| instruments_named(e, n) == 1),
+        Duration::from_millis(1_500),
+    )
+    .await;
+
+    for name in &names {
+        assert_eq!(instruments_named(&events, name), 1, "{name}");
+    }
+    assert_eq!(
+        fetches_after(&state, at_connect).await,
+        vec!["any"],
+        "one call for 50 contracts"
+    );
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        0
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_the_event_fetch_keeps_to_the_configured_currencies() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "created"));
+    let config = DeribitDataClientConfig {
+        instrument_currencies: Some(vec![DeribitCurrency::BTC]),
+        ..options_config(addr)
+    };
+    let listing = listing_with(&[NEW_OPTION.to_string()]);
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(config, &state, Some(listing)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| instruments_named(e, NEW_OPTION) == 1,
+        Duration::ZERO,
+    )
+    .await;
+
+    assert_eq!(instruments_named(&events, NEW_OPTION), 1);
+    assert_eq!(fetches_after(&state, at_connect).await, vec!["BTC"]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_state_event_for_cached_contract_fetches_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(CACHED_OPTION, "started"));
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(options_config(addr), &state, None).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, CACHED_OPTION),
+        Duration::from_millis(1_500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, CACHED_OPTION));
+    assert!(fetches_after(&state, at_connect).await.is_empty());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_failed_fetch_sends_no_instrument() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "created"));
+    // Not an array: the HTTP client fails to parse the response.
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(options_config(addr), &state, Some(json!("not an array"))).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, NEW_OPTION),
+        Duration::from_millis(1_500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, NEW_OPTION));
+    assert_eq!(instruments_named(&events, NEW_OPTION), 0);
+    assert_eq!(fetches_after(&state, at_connect).await, vec!["any"]);
+    assert!(client.is_connected());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_closed_event_fetches_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "closed"));
+    let listing = listing_with(&[NEW_OPTION.to_string()]);
+    let (mut client, mut rx, at_connect) =
+        connect_and_watch_states(options_config(addr), &state, Some(listing)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, NEW_OPTION),
+        Duration::from_millis(1_500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, NEW_OPTION));
+    assert!(fetches_after(&state, at_connect).await.is_empty());
+    client.disconnect().await.unwrap();
+}
+
+/// Connects a client and discards the instruments `connect` sends.
+async fn connect_quietly(
+    config: DeribitDataClientConfig,
+) -> (
+    DeribitDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+    (client, rx)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_unchanged_sends_nothing() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let (mut client, mut rx) = connect_quietly(create_test_config(addr)).await;
+
+    assert_eq!(client.refresh_instruments().await.unwrap(), 0);
+
+    assert!(rx.try_recv().is_err());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_sends_new_and_changed_only() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let config = DeribitDataClientConfig {
+        product_types: vec![DeribitProductType::Option],
+        ..create_test_config(addr)
+    };
+    let (mut client, mut rx) = connect_quietly(config).await;
+    let listed = load_json("http_get_instruments.json")["result"].clone();
+    let option = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "option")
+        .unwrap()
+        .clone();
+    let mut changed = option.clone();
+    changed["tick_size"] = json!(option["tick_size"].as_f64().unwrap() * 2.0);
+    let mut added = option.clone();
+    added["instrument_name"] = json!(NEW_OPTION);
+    added["strike"] = json!(110_000.0);
+    added["instrument_id"] = json!(999_999);
+    *state.instruments_override.lock().await = Some(json!([changed, added]));
+
+    assert_eq!(client.refresh_instruments().await.unwrap(), 2);
+
+    let mut names = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let DataEvent::Instrument(i) = event {
+            names.push(i.id().symbol.to_string());
+        }
+    }
+    names.sort();
+    let mut expected = vec![
+        option["instrument_name"].as_str().unwrap().to_string(),
+        NEW_OPTION.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    assert_eq!(
+        client.refresh_instruments().await.unwrap(),
+        0,
+        "the refresh remembers what it sent"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_failure_changes_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx) = connect_quietly(create_test_config(addr)).await;
+    // Not an array: the HTTP client fails to parse the response.
+    *state.instruments_override.lock().await = Some(json!("not an array"));
+
+    assert!(client.refresh_instruments().await.is_err());
+
+    assert!(rx.try_recv().is_err());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::off(0, None)]
+#[case::hourly(60, Some(Duration::from_secs(3_600)))]
+fn test_refresh_interval(#[case] mins: u64, #[case] expected: Option<Duration>) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let config = DeribitDataClientConfig {
+        update_instruments_interval_mins: mins,
+        ..create_test_config(addr)
+    };
+    let client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    assert_eq!(client.refresh_interval(), expected);
 }
