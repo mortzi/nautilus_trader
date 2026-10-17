@@ -206,6 +206,8 @@ struct TestServerState {
     instrument_state_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
     // When true, public/get_instrument answers an option with the requested name and strike.
     echo_instrument_name: Arc<AtomicBool>,
+    // When set, public/get_instruments answers every currency with this `result`.
+    instruments_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 #[derive(Default)]
@@ -433,6 +435,32 @@ async fn handle_get_instruments(
         .lock()
         .await
         .push(currency.unwrap_or("none").to_string());
+
+    if let Some(result) = state.instruments_override.lock().await.clone() {
+        let kind = params
+            .as_ref()
+            .and_then(|p| p.get("kind"))
+            .and_then(|k| k.as_str());
+        let result = match (result, kind) {
+            (Value::Array(items), Some(kind)) => Value::Array(
+                items
+                    .into_iter()
+                    .filter(|i| i.get("kind").and_then(|k| k.as_str()) == Some(kind))
+                    .collect(),
+            ),
+            (result, _) => result,
+        };
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+            "testnet": true,
+            "usIn": 1699999999000000_u64,
+            "usOut": 1699999999001000_u64,
+            "usDiff": 1000
+        }))
+        .into_response();
+    }
 
     match currency {
         Some("any" | "BTC") | None => {
@@ -2579,4 +2607,108 @@ async fn test_closed_event_fetches_nothing() {
         0
     );
     client.disconnect().await.unwrap();
+}
+
+/// Connects a client and discards the instruments `connect` sends.
+async fn connect_quietly(
+    config: DeribitDataClientConfig,
+) -> (
+    DeribitDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+    (client, rx)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_unchanged_sends_nothing() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let (mut client, mut rx) = connect_quietly(create_test_config(addr)).await;
+
+    assert_eq!(client.refresh_instruments().await.unwrap(), 0);
+
+    assert!(rx.try_recv().is_err());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_sends_new_and_changed_only() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let config = DeribitDataClientConfig {
+        product_types: vec![DeribitProductType::Option],
+        ..create_test_config(addr)
+    };
+    let (mut client, mut rx) = connect_quietly(config).await;
+    let listed = load_json("http_get_instruments.json")["result"].clone();
+    let option = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "option")
+        .unwrap()
+        .clone();
+    let mut changed = option.clone();
+    changed["tick_size"] = json!(option["tick_size"].as_f64().unwrap() * 2.0);
+    let mut added = option.clone();
+    added["instrument_name"] = json!(NEW_OPTION);
+    added["strike"] = json!(110_000.0);
+    added["instrument_id"] = json!(999_999);
+    *state.instruments_override.lock().await = Some(json!([changed, added]));
+
+    assert_eq!(client.refresh_instruments().await.unwrap(), 2);
+
+    let mut names = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let DataEvent::Instrument(i) = event {
+            names.push(i.id().symbol.to_string());
+        }
+    }
+    names.sort();
+    let mut expected = vec![
+        option["instrument_name"].as_str().unwrap().to_string(),
+        NEW_OPTION.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    assert_eq!(
+        client.refresh_instruments().await.unwrap(),
+        0,
+        "the refresh remembers what it sent"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_refresh_failure_changes_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx) = connect_quietly(create_test_config(addr)).await;
+    // Not an array: the HTTP client fails to parse the response.
+    *state.instruments_override.lock().await = Some(json!("not an array"));
+
+    assert!(client.refresh_instruments().await.is_err());
+
+    assert!(rx.try_recv().is_err());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::off(0, None)]
+#[case::hourly(60, Some(Duration::from_secs(3_600)))]
+fn test_refresh_interval(#[case] mins: u64, #[case] expected: Option<Duration>) {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let config = DeribitDataClientConfig {
+        update_instruments_interval_mins: mins,
+        ..create_test_config(addr)
+    };
+    let client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    assert_eq!(client.refresh_interval(), expected);
 }

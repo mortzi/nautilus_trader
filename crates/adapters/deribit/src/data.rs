@@ -107,6 +107,85 @@ pub struct DeribitDataClient {
     clock: &'static AtomicTime,
 }
 
+/// What the refresh (`update_instruments_interval_mins`) needs, cloned so the timer task owns it.
+struct Refresher {
+    http: DeribitHttpClient,
+    ws: Option<DeribitWebSocketClient>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    sender: EventSender<DataEvent>,
+    product_types: Vec<DeribitProductType>,
+    currencies: Vec<DeribitCurrency>,
+}
+
+impl Refresher {
+    async fn run(&self) -> anyhow::Result<usize> {
+        let mut fetched = Vec::new();
+        for product_type in &self.product_types {
+            for currency in &self.currencies {
+                fetched.extend(
+                    self.http
+                        .request_instruments(*currency, Some(*product_type))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to refresh instruments for {product_type:?} {currency:?}"
+                            )
+                        })?,
+                );
+            }
+        }
+
+        let known = self.instruments.load();
+        let changed: Vec<InstrumentAny> = fetched
+            .into_iter()
+            .filter(|i| {
+                known
+                    .get(&i.id())
+                    .is_none_or(|cached| fingerprint(cached) != fingerprint(i))
+            })
+            .collect();
+        drop(known);
+        if changed.is_empty() {
+            return Ok(0);
+        }
+
+        self.instruments.rcu(|m| {
+            for instrument in &changed {
+                m.insert(instrument.id(), instrument.clone());
+            }
+        });
+        self.http.cache_instruments(&changed);
+        if let Some(ws) = &self.ws {
+            ws.cache_instruments(&changed);
+        }
+        log::info!("Instrument refresh: {} new or changed", changed.len());
+        for instrument in &changed {
+            if let Err(e) = self.sender.send(DataEvent::Instrument(instrument.clone())) {
+                log::warn!(
+                    "Failed to send refreshed instrument {}: {e}",
+                    instrument.id()
+                );
+            }
+        }
+        Ok(changed.len())
+    }
+}
+
+/// An instrument's definition without its timestamps: `==` on instruments compares ids only.
+fn fingerprint(instrument: &InstrumentAny) -> String {
+    let mut value = serde_json::to_value(instrument).unwrap_or(serde_json::Value::Null);
+    // `{"CryptoOption": {...}}`: the fields sit one level down.
+    if let serde_json::Value::Object(outer) = &mut value {
+        for inner in outer.values_mut() {
+            if let serde_json::Value::Object(fields) = inner {
+                fields.remove("ts_event");
+                fields.remove("ts_init");
+            }
+        }
+    }
+    value.to_string()
+}
+
 /// Fetches contracts Deribit announces on `instrument.state` (`created`, `started`, …) that the
 /// client doesn't know yet: the event carries only the name, so the definition comes from one
 /// `public/get_instrument` call. The instrument is sent as [`DataEvent::Instrument`], like the ones
@@ -354,6 +433,44 @@ impl DeribitDataClient {
             return Some(DeribitUpdateInterval::Raw);
         }
         None
+    }
+
+    /// The product types to load instruments for (futures when none are configured).
+    fn product_types(&self) -> Vec<DeribitProductType> {
+        if self.config.product_types.is_empty() {
+            vec![DeribitProductType::Future]
+        } else {
+            self.config.product_types.clone()
+        }
+    }
+
+    /// How often to refresh the instruments: `update_instruments_interval_mins`, `None` for 0.
+    #[must_use]
+    pub fn refresh_interval(&self) -> Option<Duration> {
+        let mins = self.config.update_instruments_interval_mins;
+        (mins > 0).then(|| Duration::from_secs(mins * 60))
+    }
+
+    fn refresher(&self) -> Refresher {
+        Refresher {
+            http: self.http_client.clone(),
+            ws: self.ws_client.clone(),
+            instruments: Arc::clone(&self.instruments),
+            sender: self.data_sender.clone(),
+            product_types: self.product_types(),
+            currencies: self.fetch_currencies(),
+        }
+    }
+
+    /// Fetches the configured instruments again and sends the new or changed ones as
+    /// [`DataEvent::Instrument`], so the data engine adds new strikes to running option chains.
+    /// Returns how many it sent; on an error nothing is cached or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any instruments request fails.
+    pub async fn refresh_instruments(&self) -> anyhow::Result<usize> {
+        self.refresher().run().await
     }
 
     /// The currencies to load instruments for: `instrument_currencies`, or every currency.
@@ -802,11 +919,7 @@ impl DataClient for DeribitDataClient {
         register_deribit_custom_data();
 
         // Fetch instruments for each configured product type
-        let product_types = if self.config.product_types.is_empty() {
-            vec![DeribitProductType::Future]
-        } else {
-            self.config.product_types.clone()
-        };
+        let product_types = self.product_types();
 
         let mut all_instruments = Vec::new();
 
@@ -908,6 +1021,26 @@ impl DataClient for DeribitDataClient {
                 )));
             }
             return Err(e);
+        }
+
+        if let Some(every) = self.refresh_interval() {
+            let refresher = self.refresher();
+            let cancellation = self.cancellation_token.clone();
+            let timer = async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(every) => {
+                            if let Err(e) = refresher.run().await {
+                                log::warn!("Instrument refresh failed: {e:?}");
+                            }
+                        }
+                        () = cancellation.cancelled() => break,
+                    }
+                }
+            };
+            if let Err(e) = self.session_tasks.spawn(timer) {
+                log::warn!("Instrument refresh not started: {e}");
+            }
         }
 
         self.is_connected.store(true, Ordering::Release);
