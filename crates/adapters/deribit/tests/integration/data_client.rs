@@ -47,8 +47,9 @@ use nautilus_common::{
         data::{
             InstrumentResponse, RequestCustomData, RequestInstrument,
             RequestOptionChainReferencePrice, SubscribeBars, SubscribeBookDeltas,
-            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeTrades,
+            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeTrades,
         },
         system::SocketState,
     },
@@ -71,6 +72,7 @@ use nautilus_model::{
     data::{BarType, CustomData, Data, DataType, TradeTick},
     enums::BookType,
     identifiers::{InstrumentId, OptionSeriesId},
+    instruments::Instrument,
     types::Price,
 };
 use nautilus_network::http::HttpClient;
@@ -2357,5 +2359,224 @@ async fn test_data_client_request_data_ignores_unsupported_custom_type() {
             .is_err()
     );
 
+    client.disconnect().await.unwrap();
+}
+
+const NEW_OPTION: &str = "BTC-27DEC24-110000-C";
+
+fn state_event(name: &str, state: &str) -> Value {
+    json!({"instrument_name": name, "state": state, "timestamp": 1_700_000_000_000_u64})
+}
+
+fn subscribe_option_states(client: &mut DeribitDataClient) {
+    let mut params = Params::new();
+    params.insert("kind".to_string(), json!("option"));
+    params.insert("currency".to_string(), json!("BTC"));
+    client
+        .subscribe_instruments(SubscribeInstruments::new(
+            Some(*DERIBIT_CLIENT_ID),
+            *DERIBIT_VENUE,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(params),
+        ))
+        .unwrap();
+}
+
+fn instruments_named(events: &[DataEvent], name: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, DataEvent::Instrument(i) if i.id().symbol.as_str() == name))
+        .count()
+}
+
+fn has_status_for(events: &[DataEvent], name: &str) -> bool {
+    events.iter().any(
+        |e| matches!(e, DataEvent::InstrumentStatus(s) if s.instrument_id.symbol.as_str() == name),
+    )
+}
+
+/// Connects a client to the mock server (whose `instrument.state` events the caller has set),
+/// discards the instruments `connect` sends, and subscribes BTC option states.
+async fn connect_and_watch_states(
+    config: DeribitDataClientConfig,
+) -> (
+    DeribitDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+    subscribe_option_states(&mut client);
+    (client, rx)
+}
+
+/// Collects events until `done` holds for them (or the test timeout), then `settle` more.
+async fn collect_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    done: impl Fn(&[DataEvent]) -> bool,
+    settle: Duration,
+) -> Vec<DataEvent> {
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    while !done(&events) && tokio::time::Instant::now() < deadline {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            events.push(e);
+        }
+    }
+    let settle_until = tokio::time::Instant::now() + settle;
+    while tokio::time::Instant::now() < settle_until {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            events.push(e);
+        }
+    }
+    events
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_created_event_for_unknown_contract_fetches_and_sends_it() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state.echo_instrument_name.store(true, Ordering::Relaxed);
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "created"));
+    let (mut client, mut rx) = connect_and_watch_states(create_test_config(addr)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| instruments_named(e, NEW_OPTION) == 1 && has_status_for(e, NEW_OPTION),
+        Duration::ZERO,
+    )
+    .await;
+
+    assert_eq!(instruments_named(&events, NEW_OPTION), 1);
+    assert!(
+        has_status_for(&events, NEW_OPTION),
+        "the status event still arrives"
+    );
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        1
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_state_event_for_cached_contract_fetches_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    // The option connect loads from http_get_instruments.json.
+    let cached = "BTC-27DEC24-100000-C";
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(cached, "started"));
+    let config = DeribitDataClientConfig {
+        product_types: vec![DeribitProductType::Option],
+        ..create_test_config(addr)
+    };
+    let (mut client, mut rx) = connect_and_watch_states(config).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, cached),
+        Duration::from_millis(500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, cached));
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        0
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_two_events_for_one_unknown_contract_fetches_once() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state.echo_instrument_name.store(true, Ordering::Relaxed);
+    {
+        let mut payloads = state.instrument_state_payloads.lock().await;
+        payloads.push(state_event(NEW_OPTION, "created"));
+        payloads.push(state_event(NEW_OPTION, "started"));
+    }
+    let (mut client, mut rx) = connect_and_watch_states(create_test_config(addr)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| instruments_named(e, NEW_OPTION) >= 1,
+        Duration::from_millis(500),
+    )
+    .await;
+
+    assert_eq!(instruments_named(&events, NEW_OPTION), 1);
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        1
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_failed_fetch_sends_no_instrument() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state.fail_get_instrument.store(true, Ordering::Relaxed);
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "created"));
+    let (mut client, mut rx) = connect_and_watch_states(create_test_config(addr)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, NEW_OPTION),
+        Duration::from_millis(500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, NEW_OPTION));
+    assert_eq!(instruments_named(&events, NEW_OPTION), 0);
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        1
+    );
+    assert!(client.is_connected());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_closed_event_fetches_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state
+        .instrument_state_payloads
+        .lock()
+        .await
+        .push(state_event(NEW_OPTION, "closed"));
+    let (mut client, mut rx) = connect_and_watch_states(create_test_config(addr)).await;
+
+    let events = collect_until(
+        &mut rx,
+        |e| has_status_for(e, NEW_OPTION),
+        Duration::from_millis(500),
+    )
+    .await;
+
+    assert!(has_status_for(&events, NEW_OPTION));
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        0
+    );
     client.disconnect().await.unwrap();
 }

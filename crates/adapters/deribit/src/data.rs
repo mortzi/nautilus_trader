@@ -55,11 +55,11 @@ use nautilus_core::{
 };
 use nautilus_live::{
     SocketControl,
-    task::{TaskGroup, TaskGroupGuard},
+    task::{TaskGroup, TaskGroupGuard, TaskSpawner},
 };
 use nautilus_model::{
     data::{CustomData, Data, DataType},
-    enums::BookType,
+    enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::Price,
@@ -105,6 +105,65 @@ pub struct DeribitDataClient {
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     combo_leg_trade_subs: Arc<AtomicMap<InstrumentId, AHashMap<InstrumentId, usize>>>,
     clock: &'static AtomicTime,
+}
+
+/// Fetches contracts Deribit announces on `instrument.state` (`created`, `started`, …) that the
+/// client doesn't know yet: the event carries only the name, so the definition comes from one
+/// `public/get_instrument` call. The instrument is sent as [`DataEvent::Instrument`], like the ones
+/// `connect` loads, so the data engine adds it to its cache and to a running option chain.
+#[derive(Clone)]
+struct Lister {
+    http: DeribitHttpClient,
+    ws: Option<DeribitWebSocketClient>,
+    spawner: TaskSpawner,
+    /// Contracts being fetched: Deribit sends several states per contract, seconds apart.
+    in_flight: Arc<AtomicSet<InstrumentId>>,
+}
+
+impl Lister {
+    fn fetch_if_unknown(
+        &self,
+        instrument_id: InstrumentId,
+        sender: &EventSender<DataEvent>,
+        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    ) {
+        // Only the stream task calls this, so checking and inserting can't race.
+        if instruments.contains_key(&instrument_id) || self.in_flight.contains(&instrument_id) {
+            return;
+        }
+        self.in_flight.insert(instrument_id);
+
+        let lister = self.clone();
+        let sender = sender.clone();
+        let instruments = Arc::clone(instruments);
+        let spawned = self.spawner.spawn(async move {
+            match lister.http.request_instrument(instrument_id).await {
+                Ok(instrument) => {
+                    instruments.insert(instrument.id(), instrument.clone());
+                    lister
+                        .http
+                        .cache_instruments(std::slice::from_ref(&instrument));
+                    if let Some(ws) = &lister.ws {
+                        ws.cache_instruments(std::slice::from_ref(&instrument));
+                    }
+                    log::info!("Instrument listed after connect: {instrument_id}");
+
+                    if let Err(e) = sender.send(DataEvent::Instrument(instrument)) {
+                        log::warn!("Failed to send listed instrument {instrument_id}: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to fetch listed instrument {instrument_id}: {e:?}");
+                }
+            }
+            lister.in_flight.remove(&instrument_id);
+        });
+
+        if let Err(e) = spawned {
+            self.in_flight.remove(&instrument_id);
+            log::warn!("Skipping fetch of listed instrument {instrument_id}: {e}");
+        }
+    }
 }
 
 impl DeribitDataClient {
@@ -313,6 +372,15 @@ impl DeribitDataClient {
         let data_sender = self.data_sender.clone();
         let instruments = Arc::clone(&self.instruments);
         let cancellation = self.cancellation_token.clone();
+        let lister = Lister {
+            http: self.http_client.clone(),
+            ws: self.ws_client.clone(),
+            spawner: self
+                .command_tasks
+                .spawner()
+                .context("failed to get a spawner for listed-instrument fetches")?,
+            in_flight: Arc::new(AtomicSet::new()),
+        };
 
         let future = async move {
             tokio::pin!(stream);
@@ -321,7 +389,9 @@ impl DeribitDataClient {
                 tokio::select! {
                     maybe_msg = stream.next() => {
                         match maybe_msg {
-                            Some(msg) => Self::handle_ws_message(msg, &data_sender, &instruments),
+                            Some(msg) => {
+                                Self::handle_ws_message(msg, &data_sender, &instruments, &lister);
+                            }
                             None => {
                                 log::debug!("WebSocket stream ended");
                                 break;
@@ -347,6 +417,7 @@ impl DeribitDataClient {
         message: NautilusWsMessage,
         sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+        lister: &Lister,
     ) {
         match message {
             NautilusWsMessage::Data(payloads) => {
@@ -390,6 +461,13 @@ impl DeribitDataClient {
                 }
             }
             NautilusWsMessage::InstrumentStatus(status) => {
+                if matches!(
+                    status.action,
+                    MarketStatusAction::PreOpen | MarketStatusAction::Trading
+                ) {
+                    lister.fetch_if_unknown(status.instrument_id, sender, instruments);
+                }
+
                 if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
                     log::error!("Failed to send instrument status event: {e}");
                 }
